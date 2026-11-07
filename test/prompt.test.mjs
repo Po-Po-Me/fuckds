@@ -199,10 +199,13 @@ test('空 messages 报错', () => {
   assert.throws(() => buildPrompt({ messages: [] }), /messages 不能为空/);
 });
 
-test('协议声明：教原生 DSML 输出格式，不要求 DO', () => {
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('<｜DSML｜ calls>'));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('invoke name='));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('parameter name='));
+// 说明：d98e64e「降低封号风险」把 <｜DSML｜…> 这类特殊 token 的原文从 prompt 里删了，
+// 只按名字要求模型用原生 DSML 格式（模型本来就原生会说）。这里断言的是这个新契约：
+// 指名 DSML、要求名字严格匹配、不教旧的 DO: 语法、也不再出现「封禁」措辞。
+test('协议声明：按名字要求原生 DSML 格式，且不泄漏特殊 token 原文', () => {
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('DSML'));
+  assert.ok(/case-sensitive/.test(SPECIAL_TOKENS_HEADER));
+  assert.ok(!SPECIAL_TOKENS_HEADER.includes('｜'), '不再写 <｜DSML｜…> 这种特殊 token 原文');
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('DO:{"name"'));
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('封禁'));
 });
