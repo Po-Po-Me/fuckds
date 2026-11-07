@@ -18,7 +18,8 @@ import { PromptTooLongError } from '../errors.mjs';
  * - 保留**最新的**段落（真正要回答的问题在最后），较早的进附件；
  * - 空间不够时，连工具声明和客户端 system 提示也可以移进附件（先移最靠前的）；
  * - 万一最后一段自己就超长，保留它的尾部，前面部分进附件；
- * - 正文再留一点余量（reserve），给重试时的额外约束文案用。
+ * - 正文再留一点余量（reserve），给重试时的额外约束文案用；这条余量是软的：
+ *   上限本身很小时（比如测试里传 6000），留了余量就装不下任何对话，这时余量让步到 0。
  */
 
 /** 段边界：## X: 前面那个换行属于上一段的结尾，切在这里 */
@@ -66,13 +67,17 @@ export function planOverflow(prompt, options = {}) {
   const removed = [];
   let movedHead = 0;
 
-  const budgetNow = () => {
-    const inlineHead =
-      header.length +
-      protocol.text.length +
-      headBlocks.slice(movedHead).reduce((sum, block) => sum + block.text.length, 0);
-    return maxChars - reserve - inlineHead - noteLength;
-  };
+  /** 正文里躲不开的固定部分：头部 + 自带协议提示词 + 还没挪走的 system / 工具声明 */
+  const fixedInlineNow = () =>
+    header.length +
+    protocol.text.length +
+    headBlocks.slice(movedHead).reduce((sum, block) => sum + block.text.length, 0);
+
+  /** 对话段能用的绝对空间（不含 reserve） */
+  const roomNow = () => maxChars - fixedInlineNow() - noteLength;
+
+  /** 理想预算：额外留出 reserve，给重试时的约束文案用 */
+  const budgetNow = () => roomNow() - reserve;
 
   // 自带协议提示词之后的 system / 工具声明：正文空间不够时按从前往后的顺序挪进附件
   while (movedHead < headBlocks.length && budgetNow() < minDialogChars) {
@@ -80,7 +85,9 @@ export function planOverflow(prompt, options = {}) {
     movedHead += 1;
   }
 
-  const budget = budgetNow();
+  // reserve 只是「尽量」留出来的余量：上限设得很小时它会让正文连最新对话都装不下。
+  // 这种时候先保证能装下对话（否则整个请求就是硬失败），reserve 让步到 0。
+  const budget = budgetNow() > 0 ? budgetNow() : roomNow();
   if (budget <= 0) {
     throw new PromptTooLongError(
       `system / 工具声明太长：正文可用空间只剩 ${budget} 字符（上限 ${maxChars}），无法保留任何对话内容`,
