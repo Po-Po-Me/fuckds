@@ -515,6 +515,22 @@ export function installPageHelpers() {
     return false;
   }
 
+  /**
+   * 附件挂到输入框上之后，页面会在输入框附近渲染一个文件 chip（文件名 + 大小 + 格式）。
+   * 这块区域不是 composerRoot() 的子树（是它的兄弟节点），所以直接在整页找叶子节点里
+   * 有没有出现这个文件名，用来确认附件真的挂上了。
+   */
+  function hasFileChip(name) {
+    if (!name) return false;
+    const needle = String(name);
+    const nodes = document.querySelectorAll('div, span, p, a, li');
+    for (const el of nodes) {
+      if (el.children.length) continue;
+      if ((el.textContent || '').includes(needle)) return true;
+    }
+    return false;
+  }
+
   function focusInput() {
     const input = document.querySelector(SEL.input);
     if (!input) return false;
@@ -528,13 +544,14 @@ export function installPageHelpers() {
   }
 
   window.__DSW__ = {
-    version: 1,
+    version: 2,
     selectors: SEL,
     serialize,
     extract,
     clickByTexts,
     focusInput,
     inputState,
+    hasFileChip,
     detectGenerating,
     detectCaptcha,
     toggleState,

@@ -21,6 +21,15 @@ const NEW_CHAT_LABELS = ['开启新对话', '新对话', 'New chat', 'Start new 
 const STOP_LABELS = ['停止生成', '停止', 'Stop generating', 'Stop'];
 const SEND_LABELS = ['发送', '发送消息', 'Send message', 'Send'];
 
+/** 页面自己上传附件时打的接口（我们只等它的响应，不自己发请求） */
+const UPLOAD_PATH = '/api/v0/file/upload_file';
+/** 单个附件上限，和直连引擎保持一致 */
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+/** 暂存的附件句柄多久没人用就丢掉（一次请求可能连着调两次 chat） */
+const STAGED_TTL_MS = 10 * 60_000;
+/** 暂存句柄的前缀：只有这种 id 会被当作「待挂载的本地文件」 */
+const STAGED_PREFIX = 'browser-file-';
+
 /**
  * Playwright 驱动 chat.deepseek.com。
  *
@@ -42,6 +51,13 @@ export class DeepSeekWeb {
     this.closing = false;
     this.lastSendAt = 0;
     this.cooldownUntil = 0;
+    /**
+     * 附件暂存区：浏览器引擎没法像直连那样先上传拿 file id（附件必须挂在输入框上、
+     * 由页面自己和这条消息一起发出去），所以 uploadAttachments 只返回一个句柄，
+     * 真正的 setInputFiles 发生在 chat() 拿到页面之后。
+     */
+    this.stagedFiles = new Map();
+    this.stagedSeq = 0;
   }
 
   get baseUrl() {
@@ -165,18 +181,219 @@ export class DeepSeekWeb {
     };
   }
 
-  /** 浏览器引擎不支持图片输入（直连引擎才走附件上传） */
-  async uploadImages() {
-    throw new ApiError(400, '图片输入只支持直连引擎：请设置 ENGINE=direct 并执行 npm run pow:build', {
-      code: 'image_not_supported',
-    });
+  /* ------------------------------------------------------------------ *
+   * 附件 / 图片
+   *
+   * 浏览器引擎没有「先上传、再拿 file id 发消息」这条路：附件的上传是页面
+   * 跟着这条消息一起做的。所以这里分两步：
+   *   1. uploadImages / uploadAttachments 只把内容暂存起来，返回一个句柄字符串；
+   *   2. chat() 拿到页面之后，用 Playwright 的 setInputFiles() 把文件塞进页面上
+   *      那个隐藏的 <input type=file>，等页面自己传完、输入框上出现文件 chip，
+   *      再打字发送 —— 页面此时的补全请求里自然就带上了 ref_file_ids。
+   * ------------------------------------------------------------------ */
+
+  async uploadImages(images = []) {
+    return this.#stageFiles(images, 'image');
   }
 
-  /** 浏览器引擎也不支持把超长上下文转附件；只能直连 */
-  async uploadAttachments() {
-    throw new PromptTooLongError(
-      '上下文超过输入框上限，需要转成附件，但浏览器引擎不支持附件上传：请设置 ENGINE=direct，或减少上下文',
-    );
+  /** 超长上下文拆出来的 .txt 走这里（和图片共用一套暂存逻辑） */
+  async uploadAttachments(files = []) {
+    return this.#stageFiles(files, 'attachment');
+  }
+
+  #stageFiles(files, kind) {
+    if (!Array.isArray(files) || !files.length) return [];
+
+    this.#pruneStaged();
+    const ids = [];
+    for (const file of files) {
+      const buffer = file?.buffer;
+      if (!Buffer.isBuffer(buffer) || !buffer.length) {
+        throw new ApiError(400, kind === 'image' ? '图片内容为空' : '附件内容为空', {
+          code: kind === 'image' ? 'invalid_image' : 'invalid_attachment',
+        });
+      }
+      if (buffer.length > MAX_ATTACHMENT_BYTES) {
+        const mb = (buffer.length / 1024 / 1024).toFixed(1);
+        throw new ApiError(400, `附件过大（${mb}MB），上限 20MB`, { code: 'attachment_too_large' });
+      }
+
+      this.stagedSeq += 1;
+      const handle = `${STAGED_PREFIX}${Date.now().toString(36)}-${this.stagedSeq}`;
+      this.stagedFiles.set(handle, {
+        name: file.name || `upload-${this.stagedSeq}.bin`,
+        mime: file.mime || 'application/octet-stream',
+        buffer,
+        kind,
+        stagedAt: Date.now(),
+      });
+      ids.push(handle);
+    }
+    return ids;
+  }
+
+  /** 清掉长时间没被任何 chat 用到的暂存文件，避免异常请求把内存占满 */
+  #pruneStaged() {
+    const cutoff = Date.now() - STAGED_TTL_MS;
+    for (const [handle, entry] of this.stagedFiles) {
+      if (entry.stagedAt < cutoff) this.stagedFiles.delete(handle);
+    }
+  }
+
+  /** 把 chat() 收到的 refFileIds 还原成待挂载的文件列表 */
+  #resolveStaged(refFileIds) {
+    const ids = Array.isArray(refFileIds) ? refFileIds.filter((id) => typeof id === 'string' && id) : [];
+    if (!ids.length) return [];
+
+    this.#pruneStaged();
+    const files = [];
+    for (const id of ids) {
+      const entry = this.stagedFiles.get(id);
+      if (entry) {
+        files.push(entry);
+        continue;
+      }
+      if (id.startsWith(STAGED_PREFIX)) {
+        // 句柄过期（暂存超时/进程重启）：绝不能变成「悄悄少一段上下文」
+        throw new UpstreamError(`附件句柄已失效（${id}），本轮上下文无法注入，请重试`, {
+          code: 'attachment_handle_expired',
+        });
+      }
+      throw new ApiError(400, `浏览器引擎不接受外部 file id（${id}）：附件的上传与发送必须在同一轮里完成`, {
+        code: 'attachment_id_unsupported',
+      });
+    }
+    return files;
+  }
+
+  /**
+   * 把暂存的文件挂到当前页面的输入框上：setInputFiles 之后页面自己发上传请求
+   * （/api/v0/file/upload_file），拿到 file id 并在页面上渲染出文件 chip 才算成功。
+   * 任何一步没成就报错，不允许静默丢附件（否则模型会看见一段「见附件」却没有附件）。
+   */
+  async #attachFiles(page, files) {
+    if (!files.length) return;
+
+    const timeout = this.config.browser.uploadTimeoutMs;
+    const used = new Set();
+
+    for (const file of files) {
+      const name = uniqueFileName(file.name, used);
+      used.add(name);
+
+      const input = await this.#fileInput(page);
+      const uploadResponse = page
+        .waitForResponse((response) => response.url().includes(UPLOAD_PATH), { timeout })
+        .catch(() => null);
+
+      const t0 = Date.now();
+      try {
+        await input.setInputFiles({ name, mimeType: file.mime, buffer: file.buffer });
+      } catch (err) {
+        throw new UpstreamError(`把附件挂到输入框失败（${name}）：${err.message}`, {
+          code: 'attachment_attach_failed',
+        });
+      }
+
+      const response = await uploadResponse;
+      if (!response) {
+        // 页面可能没发请求就把文件吃掉了，用 chip 是否出现兜底判定
+        if (await this.#waitFileChip(page, name, 2_000)) {
+          this.log.debug('附件没有触发上传请求，但已经挂到输入框', { name, ms: Date.now() - t0 });
+          continue;
+        }
+        throw new UpstreamError(`附件上传超时（${name}）：页面上没有出现上传请求`, {
+          code: 'attachment_upload_failed',
+        });
+      }
+
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        /* 非 JSON 响应，下面按失败处理 */
+      }
+      const fileId = body?.data?.biz_data?.id;
+      if (!fileId) {
+        const message = body?.msg || body?.data?.biz_msg || `HTTP ${response.status()}`;
+        this.log.warn('上传附件失败', { name, message, status: response.status() });
+        if (response.status() === 401 || response.status() === 403) throw new AuthExpiredError();
+        if (response.status() === 429 || /频繁/.test(message)) throw new RateLimitError(message);
+        throw new UpstreamError(`上传附件失败（${name}）：${message}`, {
+          code: 'attachment_upload_failed',
+        });
+      }
+
+      // 上传接口返回的 status 是 PENDING，剩下的解析由页面/服务端自己推进；
+      // 页面上出现文件 chip 就说明这条附件已经挂在输入框上了。
+      const attached = await this.#waitFileChip(page, name, Math.min(timeout, 30_000));
+      if (!attached) {
+        const snippet = await page
+          .evaluate(() => (document.body ? (document.body.innerText || '') : '').replace(/\s+/g, ' ').slice(-400))
+          .catch(() => '');
+        this.log.warn('附件没有出现在输入框上', { name, fileId, pageText: snippet });
+        throw new UpstreamError(`附件「${name}」上传后没有出现在输入框上`, {
+          code: 'attachment_attach_failed',
+        });
+      }
+
+      this.log.debug('附件已挂到输入框', {
+        name,
+        bytes: file.buffer.length,
+        fileId,
+        status: body?.data?.biz_data?.status,
+        ms: Date.now() - t0,
+      });
+    }
+
+    // chip 出现后页面还要把文件状态刷完，留一点余量再输入正文
+    await sleep(400);
+  }
+
+  /** 页面上那个隐藏的 <input type=file>（首屏就有，multiple） */
+  async #fileInput(page) {
+    const inputs = page.locator('input[type="file"]');
+    const count = await inputs.count().catch(() => 0);
+    let fallback = null;
+    for (let i = 0; i < count; i += 1) {
+      const candidate = inputs.nth(i);
+      const accept = await candidate.getAttribute('accept').catch(() => null);
+      if (!fallback) fallback = candidate;
+      // 优先选「能吃文本/PDF」的那个，避开头像之类只收图片的 input
+      if (!accept || /\.txt|\.md|text\/plain|\.pdf/i.test(accept)) return candidate;
+    }
+    if (fallback) return fallback;
+
+    // 有些版本的 input 是点了「上传」才建的，等它出现
+    const locator = page.locator('input[type="file"]').first();
+    try {
+      await locator.waitFor({ state: 'attached', timeout: 15_000 });
+      return locator;
+    } catch {
+      throw new UpstreamError('页面上找不到文件上传的 input（网页结构可能变了）', {
+        code: 'upload_input_missing',
+      });
+    }
+  }
+
+  /** 等页面上出现文件名 chip（说明附件真的挂到输入框上了） */
+  async #waitFileChip(page, name, timeout) {
+    const deadline = Date.now() + timeout;
+    // 文件名里可能有会被压缩/折行的字符，取前 12 个字符做匹配
+    const needle = name.slice(0, 12);
+    while (Date.now() < deadline) {
+      const found = await page
+        .evaluate((value) => {
+          const helpers = window.__DSW__;
+          if (helpers && typeof helpers.hasFileChip === 'function' && helpers.hasFileChip(value)) return true;
+          const body = document.body ? document.body.innerText || '' : '';
+          return body.includes(value);
+        }, needle)
+        .catch(() => false);
+      if (found) return true;
+      await sleep(120);
+    }
+    return false;
   }
 
   /** 预热：把浏览器和第一个页面都建好，第一次请求就不用等导航 */
@@ -321,12 +538,15 @@ export class DeepSeekWeb {
    * 对话流程
    * ------------------------------------------------------------------ */
 
-  async chat({ prompt, thinking = false, search = false, signal, onDelta, onThinking, meta = {} }) {
+  async chat({ prompt, thinking = false, search = false, refFileIds = [], signal, onDelta, onThinking, meta = {} }) {
     if (prompt.length > this.config.runtime.maxPromptChars) {
       throw new PromptTooLongError(
         `拼接后的 prompt 有 ${prompt.length} 字符，超过上限 ${this.config.runtime.maxPromptChars}（可用 MAX_PROMPT_CHARS 调整）`,
       );
     }
+
+    // 附件句柄 → 待挂载的文件（不在这里上传：上传必须和这条消息在同一个页面上完成）
+    const stagedFiles = this.#resolveStaged(refFileIds);
 
     await this.ensureStarted();
     this.#resetIdleTimer();
@@ -339,10 +559,13 @@ export class DeepSeekWeb {
         const tPage = Date.now();
         await this.#prepare(page, { thinking, search });
         const tPrepare = Date.now();
+        const tAttach = stagedFiles.length ? Date.now() : 0;
+        if (stagedFiles.length) await this.#attachFiles(page, stagedFiles);
         const result = await this.#run(page, { prompt, signal, onDelta, onThinking, meta });
         result.timings = {
           acquireMs: tPage - tStart,
           prepareMs: tPrepare - tPage,
+          attachMs: tAttach ? Date.now() - tAttach : 0,
           ...result.timings,
         };
         this.log.debug('本轮耗时', result.timings);
@@ -857,6 +1080,11 @@ export class DeepSeekWeb {
 
         if (holding) {
           lastChange = now;
+        } else if (endsWithDanglingListMarker(currentAnswer)) {
+          // 页面正在渲染一个还没填内容的列表项（'- ' / '1. '）：这是过渡态，先按住不发。
+          // 一旦后面重渲染把空条目吃掉，已发文本就和最终 DOM 分叉，尾巴再也补不出去
+          // （emitDelta 只在前缀一致时追加）。这里不动 lastChange，让结束判定照常推进。
+          this.log.debug('跳过过渡态的悬空列表标记', { chars: currentAnswer.length });
         } else {
           const next = emitDelta(progress.emittedAnswer, currentAnswer, onDelta, this.log);
           if (next !== progress.emittedAnswer) {
@@ -996,6 +1224,23 @@ export class DeepSeekWeb {
 }
 
 /**
+ * 同名附件挂在同一个输入框里时，页面会把它们合并/覆盖，
+ * 这里给重名的文件加序号，保证每个都能独立出现。
+ */
+function uniqueFileName(name, used) {
+  const base = String(name || 'upload.bin');
+  if (!used.has(base)) return base;
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  for (let i = 2; i < 1000; i += 1) {
+    const candidate = `${stem}-${i}${ext}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${stem}-${Date.now()}${ext}`;
+}
+
+/**
  * 只在「新内容以旧内容为前缀」时输出增量。
  * 网页重渲染偶尔会让文本回退，这时宁可不输出，等它长回来。
  */
@@ -1009,6 +1254,14 @@ function emitDelta(previous, current, callback, logger) {
   const lcp = commonPrefixLength(previous, current);
   logger?.debug('流式文本不连续，跳过本次增量', { lcp, prev: previous.length, next: current.length });
   return previous;
+}
+
+/**
+ * DOM 里最后一个列表项只有标记、还没有内容（页面渲染到「- 」这一帧）。
+ * 这种快照是过渡态：等它长出内容再发，免得后面重渲染吃掉空条目、已发文本与最终 DOM 分叉。
+ */
+function endsWithDanglingListMarker(text) {
+  return /(?:^|\n)[ \t]*(?:[-*+]|\d+[.)])[ \t]*$/.test(String(text || ''));
 }
 
 /**

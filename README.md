@@ -418,7 +418,16 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 实测 12 万字上下文：正文 98,756 字 + 附件 25,572 字，整轮 3.8s，模型能正确引用附件里的内容。
 
-`OVERFLOW_TO_ATTACHMENT=false` 可恢复旧行为（超限直接 413）。浏览器引擎不支持附件，只能直连。
+`OVERFLOW_TO_ATTACHMENT=false` 可恢复旧行为（超限直接 413）。
+
+两个引擎都支持附件，只是方式不同：
+
+- **direct**：先 `POST /api/v0/file/upload_file` 拿 file id，再塞进 `ref_file_ids`；
+- **browser**：附件必须和这条消息一起由页面发出，所以 `uploadAttachments()` 只暂存内容并返回句柄，
+  `chat()` 拿到页面后用 `setInputFiles()` 把文件塞进输入框那个隐藏的 `<input type=file>`，
+  等页面自己上传（`/api/v0/file/upload_file`）返回 file id、输入框上出现文件 chip，再输入正文回车。
+  等不到 chip 就报错，不会静默丢掉上下文。所以浏览器引擎下附件是**每条消息重传**，
+  没有直连那套 hash 缓存；页面上传耗时上限由 `BROWSER_UPLOAD_TIMEOUT_MS`（默认 120s）约束。
 
 
 ---

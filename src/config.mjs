@@ -133,6 +133,8 @@ export function loadConfig(env = process.env) {
         .split(/\s+/)
         .filter(Boolean),
       navigationTimeoutMs: int(env.BROWSER_NAV_TIMEOUT_MS, 60_000),
+      // 附件挂到输入框后等页面自己上传+解析完的上限（毫秒）
+      uploadTimeoutMs: int(env.BROWSER_UPLOAD_TIMEOUT_MS, 120_000),
     },
     runtime: {
       concurrency: Math.max(1, int(env.CONCURRENCY, 1)),
