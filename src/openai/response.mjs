@@ -2,14 +2,31 @@ import crypto from 'node:crypto';
 
 import { estimateTokens } from '../util.mjs';
 
-export const MODELS = [
-  { id: 'deepseek-v4.1-flash-1017', object: 'model', created: 0, owned_by: 'deepseek-web' },
-];
+/**
+ * 对外声称的原生模型名（网页版背后的真实模型）；/v1/models 里排在第一位。
+ * 请求侧的模型名不校验，所以这里列出来的必须和 config.deepseek 真正接受的别名一致，
+ * 否则客户端拿到 id 再发回来会碰到 model_not_found。
+ */
+export const NATIVE_MODEL_ID = 'deepseek-v4.1-flash-1017';
+
+const modelEntry = (id) => ({ id, object: 'model', created: 0, owned_by: 'deepseek-web' });
+
+/** 固定返回原生名（不依赖 config 时的兜底列表，也用于测试与文档） */
+export const MODELS = [modelEntry(NATIVE_MODEL_ID)];
+
+/** 服务端真正接受的模型名：原生名 + 默认模型 + 所有别名，去重保序 */
+export function modelIds(config) {
+  const ids = new Set(MODELS.map((model) => model.id));
+  const deepseek = config?.deepseek ?? {};
+  if (deepseek.defaultModel) ids.add(deepseek.defaultModel);
+  for (const alias of Object.keys(deepseek.modelAliases ?? {})) ids.add(alias);
+  return [...ids];
+}
 
 export const newCompletionId = () => `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
-export function modelsResponse() {
-  return { object: 'list', data: MODELS };
+export function modelsResponse(config) {
+  return { object: 'list', data: modelIds(config).map(modelEntry) };
 }
 
 /** 非流式响应 */

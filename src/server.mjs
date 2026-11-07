@@ -79,13 +79,13 @@ export function createServer({ config, logger, web }) {
 
       if (req.method === 'GET' && url.pathname === '/v1/models') {
         requireAuth(req, config);
-        return sendJson(res, 200, modelsResponse());
+        return sendJson(res, 200, modelsResponse(config));
       }
 
       if (req.method === 'GET' && url.pathname.startsWith('/v1/models/')) {
         requireAuth(req, config);
         const id = decodeURIComponent(url.pathname.slice('/v1/models/'.length));
-        const model = modelsResponse().data.find((m) => m.id === id);
+        const model = modelsResponse(config).data.find((m) => m.id === id);
         if (!model) throw new ApiError(404, `模型不存在: ${id}`, { code: 'model_not_found' });
         return sendJson(res, 200, model);
       }

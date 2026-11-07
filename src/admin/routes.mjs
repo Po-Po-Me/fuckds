@@ -157,7 +157,7 @@ export function createAdminHandler({ config, logger, web }) {
   function buildOverview() {
     const status = web.status();
     const saved = loadTokens(config);
-    const models = modelsResponse().data.map((m) => m.id);
+    const models = modelsResponse(config).data.map((m) => m.id);
     return {
       ok: true,
       pid: process.pid,
