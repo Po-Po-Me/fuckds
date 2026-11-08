@@ -18,6 +18,10 @@ const UPLOAD_PATH = '/api/v0/file/upload_file';
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const FILE_CACHE_TTL_MS = 30 * 60_000;
+/** 暂存附件句柄多久没人用就丢掉（一次请求里换号重试会连着用几次） */
+const STAGED_TTL_MS = 10 * 60_000;
+/** 暂存句柄的前缀：只有这种 id 会被当作「待上传的本地文件」 */
+const STAGED_PREFIX = 'ds-file-';
 const API_ERROR_MAX_RETRIES = 3;
 const API_ERROR_RETRY_DELAY_MS = 500;
 
@@ -87,6 +91,13 @@ export class DirectEngine {
     this.pool = new AccountPool({ tokens: this.tokens, dataDir: config.dataDir, logger });
     this.pow = new PowSolver({ bin: config.direct.powBin, logger });
     this.fileCache = new Map();
+    /**
+     * 附件暂存区。上传必须发生在「选定账号之后」：DeepSeek 的 file id 是账号
+     * 绑定的，换号重试时继续引用上一个账号的 id，新账号解析不到附件，上游只回
+     * 一个空的 event: ready，最后被空流兜底误判成限流、连坐整个号池。
+     */
+    this.stagedFiles = new Map();
+    this.stagedSeq = 0;
     this.inflight = 0;
     this.closed = false;
     this.coldStarted = false;
@@ -102,19 +113,25 @@ export class DirectEngine {
     }
   }
 
-  /** 预热：第一个账号提前解好 PoW、建好会话，并跑一次冷启动序列 */
+  /** 预热：每个可用账号都提前解好 PoW、建好会话，并跑一次冷启动序列 */
   async warmUp() {
     await this.ensureStarted();
-    const account = this.pool.accounts[0];
-    if (!account) return;
-    this.#prefetchPow(account);
-    this.#prewarmSession(account);
-    await account.powNext?.catch((err) => this.log.warn('PoW 预热失败:', err.message));
+    // 号池模式：把每个当前可用的账号都热起来。只热第一个的话，第一个请求撞上
+    // 限流时新号还得现解 PoW + 现建会话，白等一轮。
+    const accounts = this.pool.accounts.filter((a) => a.cooldownUntil <= Date.now());
+    for (const account of accounts) {
+      this.#prefetchPow(account);
+      this.#prewarmSession(account);
+    }
+    await Promise.all(
+      accounts.map((account) => account.powNext?.catch((err) => this.log.warn(`账号 #${account.index + 1} PoW 预热失败:`, err.message))),
+    );
 
     // 冷启动：让账号在服务端有一份「网页打开过」的痕迹，
     // 而不是凭空开始发 API 请求。失败不影响主流程。
-    if (this.config.deepseek.coldStart !== false) {
-      this.#coldStart(account).catch((err) => this.log.warn('冷启动序列失败（忽略）:', err.message));
+    const first = accounts[0] ?? this.pool.accounts[0];
+    if (first && this.config.deepseek.coldStart !== false) {
+      this.#coldStart(first).catch((err) => this.log.warn('冷启动序列失败（忽略）:', err.message));
     }
   }
 
@@ -253,13 +270,16 @@ export class DirectEngine {
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
-    const [sessionId, initialPowHeader] = await Promise.all([
+    let [sessionId, initialPowHeader] = await Promise.all([
       this.#takeSession(account, signal),
       this.#powHeader(account),
     ]);
     powHeader = initialPowHeader;
     const powMs = Date.now() - powStart;
     this.#prefetchPow(account);
+
+    // 附件换成「当前账号」的 file id：换号重试时用新账号重新上传（缓存按账号分桶）
+    const fileIds = await this.#resolveFiles(refFileIds, account, signal);
 
     // 行为时序伪装：真浏览器不会「PoW 一解完就立刻发」。
     // 1) PoW 在 JS 里本就比 Go 慢，补足到合理区间；
@@ -306,7 +326,7 @@ export class DirectEngine {
             parent_message_id: null,
             model_type: 'default',
             prompt,
-            ref_file_ids: refFileIds,
+            ref_file_ids: fileIds,
             thinking_enabled: Boolean(thinking),
             search_enabled: Boolean(search),
             action: null,
@@ -424,6 +444,8 @@ export class DirectEngine {
           if (emptyRetries < 2) {
             emptyRetries += 1;
             powHeader = null; // PoW 是一次性的，重试前必须换新的
+            // 同一个会话连续空流：会话本身可能在上游被标记，换一个新的再试
+            sessionId = await this.#createSession(account, signal);
             const waitMs = 700 * emptyRetries;
             this.log.warn(
               `账号 #${account.index + 1} 收到空流，${waitMs}ms 后重试（${emptyRetries}/2）`,
@@ -459,77 +481,114 @@ export class DirectEngine {
    * 把图片传成 DeepSeek 的附件，返回 file id 列表（塞进 ref_file_ids）。
    * 按内容 hash 缓存 30 分钟，同一张图重复问不会重复上传。
    */
-  async uploadImages(images = []) {
-    if (!images.length) return [];
-    await this.ensureStarted();
-    const account = this.#uploadAccount();
+  /* ------------------------------------------------------------------ *
+   * 附件 / 图片
+   *
+   * 上传必须发生在「选定账号之后」：DeepSeek 的 file id 是账号绑定的，换号
+   * 重试时如果继续引用上一个账号的 id，新账号解析不到附件，上游只回一个空的
+   * event: ready —— 最后被空流兜底误判成「限流」，一次失败连坐整个号池。
+   *
+   * 所以这里和浏览器引擎保持同一套语义：
+   *   1. uploadImages / uploadAttachments 只校验内容、暂存 buffer，返回句柄；
+   *   2. chat() 把句柄带进 #run，用「当前账号」上传换成真实 file id；
+   *   3. 上传缓存按 account.index 分桶，每个账号各自复用，绝不跨账号共享。
+   * ------------------------------------------------------------------ */
 
-    const ids = [];
-    for (const image of images) {
-      const buffer = image?.buffer;
-      if (!Buffer.isBuffer(buffer) || !buffer.length) {
-        throw new ApiError(400, '图片内容为空', { code: 'invalid_image' });
-      }
-      if (buffer.length > MAX_IMAGE_BYTES) {
-        throw new ApiError(400, `图片过大（${(buffer.length / 1024 / 1024).toFixed(1)}MB），上限 10MB`, {
-          code: 'image_too_large',
-        });
-      }
-      ids.push(
-        await this.#uploadFile(account, {
-          buffer,
-          mime: image.mime || 'image/png',
-          name: image.name || `image-${Date.now()}.png`,
-        }),
-      );
-    }
-    return ids;
+  /** 图片：校验并暂存，返回句柄（真正的上传在 #run 里按账号做） */
+  async uploadImages(images = []) {
+    return this.#stageFiles(images, 'image');
   }
 
-  /**
-   * 通用附件上传：超长上下文拆出来的 .txt 走这里。
-   * 和图片共用一套 hash 缓存，同样内容 30 分钟内不重复上传。
-   */
+  /** 超长上下文拆出来的 .txt 走这里（和图片共用一套暂存逻辑） */
   async uploadAttachments(files = []) {
-    if (!files.length) return [];
-    await this.ensureStarted();
-    const account = this.#uploadAccount();
+    return this.#stageFiles(files, 'attachment');
+  }
 
+  #stageFiles(files, kind) {
+    if (!Array.isArray(files) || !files.length) return [];
+
+    this.#pruneStaged();
     const ids = [];
     for (const file of files) {
       const buffer = file?.buffer;
       if (!Buffer.isBuffer(buffer) || !buffer.length) {
-        throw new ApiError(400, '附件内容为空', { code: 'invalid_attachment' });
-      }
-      if (buffer.length > MAX_ATTACHMENT_BYTES) {
-        throw new ApiError(400, `附件过大（${(buffer.length / 1024 / 1024).toFixed(1)}MB），上限 20MB`, {
-          code: 'attachment_too_large',
+        throw new ApiError(400, kind === 'image' ? '图片内容为空' : '附件内容为空', {
+          code: kind === 'image' ? 'invalid_image' : 'invalid_attachment',
         });
       }
-      ids.push(
-        await this.#uploadFile(account, {
-          buffer,
-          mime: file.mime || 'text/plain',
-          name: file.name || `context-${Date.now()}.txt`,
-        }),
-      );
+      const limit = kind === 'image' ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES;
+      if (buffer.length > limit) {
+        const mb = (buffer.length / 1024 / 1024).toFixed(1);
+        const label = kind === 'image' ? '图片' : '附件';
+        throw new ApiError(400, `${label}过大（${mb}MB），上限 ${limit / 1024 / 1024}MB`, {
+          code: kind === 'image' ? 'image_too_large' : 'attachment_too_large',
+        });
+      }
+
+      this.stagedSeq += 1;
+      const handle = `${STAGED_PREFIX}${Date.now().toString(36)}-${this.stagedSeq}`;
+      this.stagedFiles.set(handle, {
+        name:
+          file.name ||
+          (kind === 'image' ? `image-${Date.now()}.png` : `context-${Date.now()}.txt`),
+        mime: file.mime || (kind === 'image' ? 'image/png' : 'text/plain'),
+        buffer,
+        kind,
+        stagedAt: Date.now(),
+      });
+      ids.push(handle);
     }
     return ids;
   }
 
-  #uploadAccount() {
-    const account = this.pool.pick() || this.pool.accounts[0];
-    if (!account) throw new AuthExpiredError();
-    return account;
+  /** 清掉长时间没被任何 chat 用到的暂存内容，避免异常请求把内存占满 */
+  #pruneStaged() {
+    const cutoff = Date.now() - STAGED_TTL_MS;
+    for (const [handle, entry] of this.stagedFiles) {
+      if (entry.stagedAt < cutoff) this.stagedFiles.delete(handle);
+    }
   }
 
-  async #uploadFile(account, file) {
+  /**
+   * 把 chat() 收到的 refFileIds 换成真实 file id：暂存句柄用「当前账号」上传，
+   * 认不出的 id 原样透传（调用方自己负责它属于哪个账号）。
+   */
+  async #resolveFiles(refFileIds, account, signal) {
+    const ids = Array.isArray(refFileIds)
+      ? refFileIds.filter((id) => typeof id === 'string' && id)
+      : [];
+    if (!ids.length) return [];
+
+    this.#pruneStaged();
+    const resolved = [];
+    for (const id of ids) {
+      const staged = this.stagedFiles.get(id);
+      if (staged) {
+        resolved.push(await this.#uploadFile(account, staged, signal));
+        continue;
+      }
+      if (id.startsWith(STAGED_PREFIX)) {
+        // 句柄过期（暂存超时/进程重启）：绝不能变成「悄悄少一段上下文」。
+        // 用 400 而不是 UpstreamError：这不是账号的问题，不能触发换号重试/冷却。
+        throw new ApiError(400, `附件句柄已失效（${id}），本轮上下文无法注入，请重试`, {
+          code: 'attachment_handle_expired',
+        });
+      }
+      // 不是本引擎发的句柄：当作上游 file id 直接透传（旧调用方式仍可用）
+      resolved.push(id);
+    }
+    return resolved;
+  }
+
+  async #uploadFile(account, file, signal) {
     const { buffer, mime, name } = file;
-    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    // 缓存必须按账号分桶：同一个文件对不同账号是不同的 file id，
+    // 共用一份缓存会让 A 号上传的 id 被 B 号拿去引用（这正是空流的根因）。
+    const digest = crypto.createHash('sha256').update(buffer).digest('hex');
+    const hash = `${account.index}:${digest}`;
     const cached = this.fileCache.get(hash);
     if (cached && cached.expiresAt > Date.now()) return cached.id;
-    // 原来只在命中时检查过期：长期运行的进程里过期条目永远不删，
-    // Map 会随上传次数无限增长。这里在写入前顺手清掉过期项并设上限。
+    // 写入前顺手清掉过期项并设上限，避免长期运行的进程里 Map 无限增长
     if (cached) this.fileCache.delete(hash);
     if (this.fileCache.size >= 512) {
       const now = Date.now();
@@ -554,6 +613,7 @@ export class DirectEngine {
     });
     const res = await fetch(`${this.baseUrl}${UPLOAD_PATH}`, {
       method: 'POST',
+      signal,
       headers: { ...uploadHeaders, 'x-ds-pow-response': powHeader },
       body: form,
     });
@@ -568,14 +628,9 @@ export class DirectEngine {
     }
 
     this.fileCache.set(hash, { id, expiresAt: Date.now() + FILE_CACHE_TTL_MS });
-    this.log.debug('附件已上传', { name, bytes: buffer.length });
+    this.log.debug('附件已上传', { name, bytes: buffer.length, account: account.index + 1 });
     return id;
   }
-
-  /* ------------------------------------------------------------------ *
-   * 每账号的 PoW / 会话缓存
-   * ------------------------------------------------------------------ */
-
   #headers(account) {
     return buildBrowserHeaders({
       baseUrl: this.baseUrl,
@@ -616,6 +671,11 @@ export class DirectEngine {
     if (!session?.id) {
       if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
       const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      // 死号上游也回 200，只是 biz_msg 里写着 invalid token。认出来按登录态失效处理，
+      // 否则号池每轮冷却完又会先撞一次这个号、白失败一次才换号。
+      if (/invalid token|INVALID_TOKEN|Authorization Failed/i.test(message)) {
+        throw new AuthExpiredError(`账号登录态已失效：${message}`);
+      }
       if (res.status === 429 || /频繁/.test(message)) throw new RateLimitError(message);
       throw new UpstreamError(`创建会话失败：${message}`, { code: 'session_failed' });
     }
@@ -632,10 +692,12 @@ export class DirectEngine {
     const challenge = body?.data?.biz_data?.challenge;
     if (!challenge) {
       if (res.status === 401 || res.status === 403) throw new AuthExpiredError();
-      throw new UpstreamError(
-        `获取 PoW 挑战失败：${body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`}`,
-        { code: 'pow_challenge_failed' },
-      );
+      const message = body?.msg || body?.data?.biz_msg || `HTTP ${res.status}`;
+      // 同 #createSession：死号的 200 响应靠 msg 里认，别当成普通上游错误反复重试
+      if (/invalid token|INVALID_TOKEN|Authorization Failed/i.test(message)) {
+        throw new AuthExpiredError(`账号登录态已失效：${message}`);
+      }
+      throw new UpstreamError(`获取 PoW 挑战失败：${message}`, { code: 'pow_challenge_failed' });
     }
     return challenge;
   }
